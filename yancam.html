@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Моя Волна + Камера</title>
+    <style>
+        :root {
+            --cam-scale: 1;
+            --cam-x: 0px;
+            --cam-y: 0px;
+        }
+
+        /* Фон делаем прозрачным для OBS */
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background: transparent;
+            overflow: hidden;
+            font-family: sans-serif;
+        }
+        
+        /* Волна на заднем плане */
+        #vibeCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+            background: transparent;
+        }
+
+        /* Твоя камера поверх волны */
+        #webcamCanvas {
+            position: absolute;
+            bottom: 0; /* Привязываем к низу экрана */
+            left: 50%;
+            height: 100vh; /* Занимаем всю высоту экрана */
+            width: auto;
+            z-index: 2;
+            background: transparent;
+            
+            /* Центрируем, зеркалим и применяем настройки */
+            transform-origin: bottom center;
+            transform: translate(calc(-50% + var(--cam-x)), var(--cam-y)) scale(var(--cam-scale)) scaleX(-1);
+            pointer-events: none;
+        }
+
+        #videoSource {
+            display: none;
+        }
+
+        #start-btn {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 15px 30px;
+            font-size: 20px;
+            color: #fff;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            border-radius: 30px;
+            cursor: pointer;
+            backdrop-filter: blur(5px);
+            z-index: 100;
+        }
+        #start-btn:hover { background: rgba(255, 255, 255, 0.2); }
+        
+        #loading-text {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #fff;
+            z-index: 100;
+            display: none;
+            background: rgba(0,0,0,0.5);
+            padding: 10px;
+            border-radius: 5px;
+        }
+
+        /* Панель настроек */
+        #controls-ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            font-family: monospace;
+            z-index: 1000;
+            transition: opacity 0.3s ease;
+            pointer-events: none; /* Чтобы панель не мешала кликать */
+        }
+        #controls-ui.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+        #controls-ui h3 {
+            margin: 0 0 10px 0;
+            font-size: 14px;
+            color: #aaa;
+        }
+        #controls-ui p {
+            margin: 5px 0;
+            font-size: 13px;
+        }
+        #controls-ui .val { color: #4da6ff; font-weight: bold; }
+    </style>
+    
+    <script type="module">
+        import { FilesetResolver, ImageSegmenter } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8";
+        window.MediaPipe = { FilesetResolver, ImageSegmenter };
+    </script>
+</head>
+<body>
+    <div id="loading-text">Загрузка нейросети...</div>
+    
+    <!-- Панель настроек -->
+    <div id="controls-ui">
+        <h3>Управление камерой (нажми H чтобы скрыть)</h3>
+        <p>Размер: <span id="ui-scale" class="val">1.00</span></p>
+        <p>Позиция Y: <span id="ui-y" class="val">0</span> px</p>
+        <p>Позиция X: <span id="ui-x" class="val">0</span> px</p>
+        <p style="margin-top: 10px; color: #888; font-size: 11px;">Клавиши: ↑ ↓ ← → | + / -</p>
+    </div>
+
+    <button id="start-btn">Запустить (Нужна Камера и Микрофон)</button>
+    
+    <video id="videoSource" autoplay playsinline></video>
+    <canvas id="vibeCanvas"></canvas>
+    <canvas id="webcamCanvas"></canvas>
+
+    <script>
+        // ==========================================
+        // 1. ШЕЙДЕРЫ ВОЛНЫ (Оригинал)
+        // ==========================================
+        const vertexShaderSource = `
+            precision highp float;
+            attribute vec2 position;
+            varying highp vec2 textureUv;
+            void main() {
+                textureUv = position * 0.5 + 0.5;
+                gl_Position = vec4(position, 0.0, 1.0);
+            }
+        `;
+
+        const glslCommon = `
+            uniform float vTime;
+            #define EFFECT_PI 3.1415
+            #define TWO_EFFECT_PI 6.283
+            #define MATH_PI 3.14159265359
+            #define TWO_MATH_PI 6.28318530718
+            #define INV_TWO_EFFECT_PI 0.15915963712
+            #define CIRCLE_WIDTH_BASE 0.8
+            #define CIRCLE_WIDTH_STEP 0.2
+            #define SPARK_STRENGTH_BASE 1.0
+            #define SPARK_STRENGTH_STEP 0.3
+            #define CIRCLE_RADIUS_BASE 0.95
+            #define CIRCLE_RADIUS_STEP 0.15
+            #define CIRCLE_OFFSET_BASE 0.0
+            #define CIRCLE_OFFSET_STEP 1.57
+
+            vec4 permute(vec4 x){return mod(((x*34.0)+1.0)*x, 289.0);}
+            vec4 taylorInvSqrt(vec4 r){return 1.79284291400159 - 0.85373472095314 * r;}
+
+            float snoise3(vec3 v) {
+                const vec2 C = vec2(0.1666667, 0.3333333);
+                const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+                vec3 i = floor(v + dot(v, C.yyy));
+                vec3 x0 = v - i + dot(i, C.xxx);
+                vec3 g = step(x0.yzx, x0.xyz);
+                vec3 l = 1.0 - g;
+                vec3 i1 = min(g.xyz, l.zxy);
+                vec3 i2 = max(g.xyz, l.zxy);
+                vec3 x1 = x0 - i1 + C.xxx;
+                vec3 x2 = x0 - i2 + 2.0 * C.xxx;
+                vec3 x3 = x0 - 1.0 + 3.0 * C.xxx;
+                i = mod(i, 289.0);
+                vec4 p = permute(permute(permute(
+                    i.z + vec4(0.0, i1.z, i2.z, 1.0))
+                    + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+                    + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+                float n_ = 0.142857142857;
+                vec3 ns = n_ * D.wyz - D.xzx;
+                vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+                vec4 x_ = floor(j * ns.z);
+                vec4 y_ = floor(j - 7.0 * x_);
+                vec4 x = x_ * ns.x + ns.yyyy;
+                vec4 y = y_ * ns.x + ns.yyyy;
+                vec4 h = 1.0 - abs(x) - abs(y);
+                vec4 b0 = vec4(x.xy, y.xy);
+                vec4 b1 = vec4(x.zw, y.zw);
+                vec4 s0 = floor(b0) * 2.0 + 1.0;
+                vec4 s1 = floor(b1) * 2.0 + 1.0;
+                vec4 sh = -step(h, vec4(0.0));
+                vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+                vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+                vec3 p0 = vec3(a0.xy, h.x);
+                vec3 p1 = vec3(a0.zw, h.y);
+                vec3 p2 = vec3(a1.xy, h.z);
+                vec3 p3 = vec3(a1.zw, h.w);
+                vec4 norm = taylorInvSqrt(vec4(dot(p0, p0), dot(p1, p1), dot(p2, p2), dot(p3, p3)));
+                p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+                vec4 m = max(0.6 - vec4(dot(x0, x0), dot(x1, x1), dot(x2, x2), dot(x3, x3)), 0.0);
+                m *= m;
+                return 42.0 * dot(m * m, vec4(dot(p0, x0), dot(p1, x1), dot(p2, x2), dot(p3, x3)));
+            }
+            vec2 rotate(vec2 p, float angle) {
+                float s = sin(angle);
+                float c = cos(angle);
+                return vec2(p.x * c - p.y * s, p.x * s + p.y * c);
+            }
+        `;
+
+        const noiseCacheFrag = `
+            precision highp float;
+            varying highp vec2 textureUv;
+            uniform vec2 vScreenSize;
+            uniform float vScale;
+            uniform vec3 vRotation[3];
+            uniform float vReact[3];
+            ${glslCommon}
+            vec2 getEffectUv() {
+                float invMinScreenScale = 1.0 / (min(vScreenSize.x, vScreenSize.y) * vScale);
+                return (textureUv * 2.0 - 1.0) * vScreenSize * invMinScreenScale;
+            }
+            float getLayerNoise(vec2 uv, float reaction, vec3 rotation, float offset) {
+                vec2 noiseOffset = rotate(rotation.xy, vTime * rotation.z);
+                vec2 localUv = uv * (1.0 - reaction * 0.5) + noiseOffset;
+                return clamp(snoise3(vec3(localUv * 1.2 + offset, vTime * 0.5 + offset)) * 0.5 + 0.5, 0.0, 1.0);
+            }
+            void main() {
+                vec2 uv = getEffectUv();
+                float sharedNoise = clamp(snoise3(vec3(uv * 1.2, vTime * 0.5)), -1.0, 1.0);
+                float n0 = getLayerNoise(uv, vReact[0], vRotation[0], 0.0);
+                float n1 = getLayerNoise(uv, vReact[1], vRotation[1], 1.57);
+                float n2 = getLayerNoise(uv, vReact[2], vRotation[2], 3.14);
+                gl_FragColor = vec4(sharedNoise * 0.5 + 0.5, n0, n1, n2);
+            }
+        `;
+
+        const sparkLutFrag = `
+            precision highp float;
+            varying highp vec2 textureUv;
+            ${glslCommon}
+            float tri(float x){return abs(fract(x) - 0.5);}
+            vec3 tri3(vec3 p) {
+                float triangleX = tri(p.x);
+                return vec3(tri(p.z + tri(p.y * 20.0)), tri(p.z + triangleX), tri(p.y + triangleX));
+            }
+            float triNoise3D(vec3 p) {
+                float z = 0.4;
+                float result = 0.1;
+                vec3 base = p;
+                float timeShift = vTime * 0.01;
+                for (int octave = 0; octave < 5; ++octave) {
+                    vec3 displacement = tri3(base * 0.01);
+                    p += displacement + timeShift;
+                    base *= 4.0; z *= 0.9; p *= 1.6;
+                    result += tri(p.z + tri(0.6 * p.x + 0.1 * tri(p.y))) / z;
+                }
+                return smoothstep(0.0, 8.0, result + sin(result + sin(z) * 2.8) * 2.2);
+            }
+            float getRawSpark(float angleIndex) {
+                float angle = angleIndex * TWO_EFFECT_PI;
+                float shiftedAngle = angle + EFFECT_PI;
+                if (shiftedAngle > MATH_PI) shiftedAngle -= TWO_MATH_PI;
+                float shiftedIndex = shiftedAngle * INV_TWO_EFFECT_PI;
+                float seamAngle = (shiftedAngle + EFFECT_PI) * 0.5;
+                float seamWeight = smoothstep(0.9, 1.0, sin(seamAngle));
+                float spark = triNoise3D(vec3(angleIndex, 0.0, 0.0));
+                if (seamWeight > 0.0) {
+                    float seamSpark = triNoise3D(vec3(shiftedIndex, 0.0, shiftedIndex));
+                    spark = mix(spark, seamSpark, seamWeight);
+                }
+                return spark;
+            }
+            void main() {
+                float angleIndex = textureUv.x - 0.5;
+                gl_FragColor = vec4(getRawSpark(angleIndex), 0.0, 0.0, 1.0);
+            }
+        `;
+
+        const compositeFrag = `
+            precision highp float;
+            varying highp vec2 textureUv;
+            uniform vec2 vScreenSize;
+            uniform float vScale;
+            uniform vec3 vColorBackground;
+            uniform vec3 vColor[6];
+            uniform vec3 vRotation[3];
+            uniform float vAudio[3];
+            uniform float vReact[3];
+            uniform sampler2D vNoiseCache;
+            uniform sampler2D vSparkLut;
+            ${glslCommon}
+            
+            float shapeSpark(float rawSpark) {
+                float spark2 = rawSpark * rawSpark;
+                float spark4 = spark2 * spark2;
+                float spark8 = spark4 * spark4;
+                float spark = rawSpark * 0.2 + spark8 * spark2;
+                float gateInput = clamp(0.3 / max(spark, 0.00001), 0.0, 1.0);
+                float gate = gateInput * gateInput * (3.0 - 2.0 * gateInput);
+                return spark * gate;
+            }
+            vec4 makeBlobFromCachedNoise(vec2 uv, float baseLen, float layerNoise, float blob, vec3 color1, vec3 color2, float width, float baseReaction, float likeReaction, float audioStrength, float offset, vec3 rotation) {
+                float reaction = clamp(max(likeReaction, audioStrength * 1.2), 0.0, 1.0);
+                float outerRadius = blob + width * 0.5 + baseReaction * (1.0 + reaction * 6.0 * baseReaction);
+                if (baseLen >= outerRadius) return vec4(0.0);
+                vec2 noiseOffset = rotate(rotation.xy, vTime * rotation.z);
+                vec2 localUv = uv * (1.0 - reaction * 0.1) + noiseOffset;
+                float localLen = length(localUv);
+                float expandedLayerNoise = layerNoise + reaction * 0.3;
+                float distanceToNoise = abs(localLen - expandedLayerNoise);
+                float innerEdge = expandedLayerNoise + 1.1 + sin(vTime + offset);
+                float alpha = 1.0 - smoothstep(expandedLayerNoise, innerEdge, localLen);
+                float outerMask = 1.0 - smoothstep(0.5, outerRadius, baseLen);
+                alpha *= outerMask;
+                float intensity = 0.15 * (1.0 - 0.75 * sin(vTime * 2.0 + offset * 0.5)) + 0.3 * reaction * 1.5;
+                float glow = intensity / (1.0 + 11.0 * distanceToNoise);
+                vec3 color = clamp(mix(color1, color2, localUv.y * 2.0) + glow, 0.0, 1.0);
+                color += 0.4 * reaction * (1.0 - smoothstep(0.2, outerRadius * 0.8, baseLen));
+                return vec4(color, alpha);
+            }
+            vec2 getEffectUv() {
+                float invMinScreenScale = 1.0 / (min(vScreenSize.x, vScreenSize.y) * vScale);
+                return (textureUv * 2.0 - 1.0) * vScreenSize * invMinScreenScale;
+            }
+            void main() {
+                vec2 uv = getEffectUv();
+                float voiceDistortion = vAudio[0] * 0.06 + vAudio[1] * 0.03;
+                uv.x += sin(uv.y * 4.0 + vTime * 2.0) * voiceDistortion;
+                uv.y += cos(uv.x * 4.0 + vTime * 2.0) * voiceDistortion;
+                float baseLen = length(uv);
+                float angleIndex = atan(uv.y, uv.x) * INV_TWO_EFFECT_PI;
+                float sparkTextureX = fract(angleIndex + 0.5);
+                vec4 cachedNoise = texture2D(vNoiseCache, textureUv);
+                float sharedNoise = cachedNoise.r * 2.0 - 1.0;
+                float spark = shapeSpark(texture2D(vSparkLut, vec2(sparkTextureX, 0.5)).r);
+                vec3 color = vColorBackground;
+                vec4 blobColor;
+                blobColor = makeBlobFromCachedNoise(uv, baseLen, cachedNoise.g, CIRCLE_RADIUS_BASE - CIRCLE_RADIUS_STEP * 0.0 + 0.3 * sharedNoise, vColor[0], vColor[3], CIRCLE_WIDTH_BASE - CIRCLE_WIDTH_STEP * 0.0, (SPARK_STRENGTH_BASE - SPARK_STRENGTH_STEP * 0.0) * spark, vReact[0], vAudio[0], CIRCLE_OFFSET_BASE + CIRCLE_OFFSET_STEP * 0.0, vRotation[0]);
+                color = mix(color, blobColor.rgb, blobColor.a);
+                blobColor = makeBlobFromCachedNoise(uv, baseLen, cachedNoise.b, CIRCLE_RADIUS_BASE - CIRCLE_RADIUS_STEP * 1.0 + 0.3 * sharedNoise, vColor[1], vColor[4], CIRCLE_WIDTH_BASE - CIRCLE_WIDTH_STEP * 1.0, (SPARK_STRENGTH_BASE - SPARK_STRENGTH_STEP * 1.0) * spark, vReact[1], vAudio[1], CIRCLE_OFFSET_BASE + CIRCLE_OFFSET_STEP * 1.0, vRotation[1]);
+                color = mix(color, blobColor.rgb, blobColor.a);
+                blobColor = makeBlobFromCachedNoise(uv, baseLen, cachedNoise.a, CIRCLE_RADIUS_BASE - CIRCLE_RADIUS_STEP * 2.0 + 0.3 * sharedNoise, vColor[2], vColor[5], CIRCLE_WIDTH_BASE - CIRCLE_WIDTH_STEP * 2.0, (SPARK_STRENGTH_BASE - SPARK_STRENGTH_STEP * 2.0) * spark, vReact[2], vAudio[2], CIRCLE_OFFSET_BASE + CIRCLE_OFFSET_STEP * 2.0, vRotation[2]);
+                color = mix(color, blobColor.rgb, blobColor.a);
+                gl_FragColor = vec4(color, 1.0);
+            }
+        `;
+
+        // ==========================================
+        // 2. ИНИЦИАЛИЗАЦИЯ ВОЛНЫ
+        // ==========================================
+        const vibeCanvas = document.getElementById('vibeCanvas');
+        const gl = vibeCanvas.getContext('webgl', { alpha: true, premultipliedAlpha: false });
+        
+        function createShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) return null;
+            return shader;
+        }
+        function createProgram(gl, vs, fs) {
+            const p = gl.createProgram();
+            gl.attachShader(p, createShader(gl, gl.VERTEX_SHADER, vs));
+            gl.attachShader(p, createShader(gl, gl.FRAGMENT_SHADER, fs));
+            gl.linkProgram(p);
+            return p;
+        }
+
+        const progNoise = createProgram(gl, vertexShaderSource, noiseCacheFrag);
+        const progSpark = createProgram(gl, vertexShaderSource, sparkLutFrag);
+        const progComposite = createProgram(gl, vertexShaderSource, compositeFrag);
+
+        const buffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+
+        let fboNoise, texNoise, fboSpark, texSpark;
+        function initFBOs(w, h) {
+            texNoise = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texNoise);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, Math.round(w*0.5), Math.round(h*0.5), 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            fboNoise = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fboNoise);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texNoise, 0);
+
+            texSpark = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texSpark);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 512, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            fboSpark = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fboSpark);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texSpark, 0);
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        }
+        
+        let colors = [[0.9, 0.2, 0.2], [0.8, 0.1, 0.6], [0.3, 0.1, 0.8], [0.9, 0.5, 0.2], [0.7, 0.2, 0.7], [0.2, 0.4, 0.9]];
+        let startTime = performance.now();
+        
+        function resize() {
+            vibeCanvas.width = window.innerWidth * (window.devicePixelRatio || 1);
+            vibeCanvas.height = window.innerHeight * (window.devicePixelRatio || 1);
+            gl.viewport(0, 0, vibeCanvas.width, vibeCanvas.height);
+            initFBOs(vibeCanvas.width, vibeCanvas.height);
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // ==========================================
+        // 3. МИКРОФОН + ВЕБ-КАМЕРА + MEDIAPIPE
+        // ==========================================
+        const video = document.getElementById('videoSource');
+        const camCanvas = document.getElementById('webcamCanvas');
+        const ctx = camCanvas.getContext('2d');
+        const startBtn = document.getElementById('start-btn');
+        const loadingText = document.getElementById('loading-text');
+
+        let analyser = null;
+        let dataArray = null;
+        let audioCtx = null;
+        let smoothAudio = [0, 0, 0];
+        let fakeAudio = [0, 0, 0];
+        let segmenter = null;
+        let isCameraReady = false;
+
+        const maskCanvas = document.createElement('canvas');
+        const maskCtx = maskCanvas.getContext('2d');
+
+        async function initAll() {
+            startBtn.style.display = 'none';
+            loadingText.style.display = 'block';
+
+            // 1. Микрофон
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const source = audioCtx.createMediaStreamSource(stream);
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 512;
+                source.connect(analyser);
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+            } catch (e) { console.error("Микрофон:", e); }
+
+            // 2. Камера
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: false });
+                video.srcObject = stream;
+                video.onloadedmetadata = () => {
+                    camCanvas.width = video.videoWidth;
+                    camCanvas.height = video.videoHeight;
+                    maskCanvas.width = video.videoWidth;
+                    maskCanvas.height = video.videoHeight;
+                    isCameraReady = true;
+                };
+            } catch (e) { 
+                console.error("Камера:", e); 
+                loadingText.innerText = "Ошибка камеры";
+                return;
+            }
+
+            // 3. MediaPipe
+            try {
+                const vision = await window.MediaPipe.FilesetResolver.forVisionTasks(
+                    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm"
+                );
+                segmenter = await window.MediaPipe.ImageSegmenter.createFromOptions(vision, {
+                    baseOptions: {
+                        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite",
+                        delegate: "GPU"
+                    },
+                    runningMode: "VIDEO",
+                    outputCategoryMask: true,
+                    outputConfidenceMasks: false
+                });
+                loadingText.style.display = 'none';
+            } catch (e) {
+                console.error("MediaPipe:", e);
+                loadingText.innerText = "Ошибка загрузки нейросети";
+            }
+        }
+
+        startBtn.addEventListener('click', initAll);
+
+        function getAverageVolume(startFreq, endFreq) {
+            if (!analyser || !dataArray) return 0;
+            const sampleRate = audioCtx.sampleRate;
+            const binWidth = (sampleRate / 2) / analyser.frequencyBinCount;
+            const startIndex = Math.floor(startFreq / binWidth);
+            const endIndex = Math.floor(endFreq / binWidth);
+            let sum = 0, count = 0;
+            for (let i = startIndex; i < endIndex; i++) {
+                if (i < dataArray.length) { sum += dataArray[i]; count++; }
+            }
+            return count === 0 ? 0 : (sum / count) / 255.0;
+        }
+
+        function renderCamera() {
+            if (!isCameraReady) return;
+            ctx.clearRect(0, 0, camCanvas.width, camCanvas.height);
+            
+            if (segmenter) {
+                try {
+                    const result = segmenter.segmentForVideo(video, performance.now());
+                    if (result.categoryMask) {
+                        const mask = result.categoryMask.getAsUint8Array();
+                        const imgData = maskCtx.createImageData(maskCanvas.width, maskCanvas.height);
+
+                        for (let i = 0; i < mask.length; i++) {
+                            const val = mask[i] === 0 ? 255 : 0;
+                            imgData.data[i * 4 + 0] = 255;
+                            imgData.data[i * 4 + 1] = 255;
+                            imgData.data[i * 4 + 2] = 255;
+                            imgData.data[i * 4 + 3] = val;
+                        }
+                        maskCtx.putImageData(imgData, 0, 0);
+
+                        ctx.globalCompositeOperation = 'source-over';
+                        ctx.drawImage(video, 0, 0, camCanvas.width, camCanvas.height);
+                        ctx.globalCompositeOperation = 'destination-in';
+                        ctx.drawImage(maskCanvas, 0, 0);
+                        ctx.globalCompositeOperation = 'source-over';
+                    }
+                } catch (e) { 
+                    ctx.drawImage(video, 0, 0, camCanvas.width, camCanvas.height);
+                }
+            } else {
+                ctx.drawImage(video, 0, 0, camCanvas.width, camCanvas.height);
+            }
+        }
+
+        // ==========================================
+        // 4. УПРАВЛЕНИЕ КАМЕРОЙ (КЛАВИШИ)
+        // ==========================================
+        let camScale = 1.0;
+        let camX = 0;
+        let camY = 0;
+        const controlsUi = document.getElementById('controls-ui');
+        const uiScale = document.getElementById('ui-scale');
+        const uiX = document.getElementById('ui-x');
+        const uiY = document.getElementById('ui-y');
+
+        // Показываем панель при запуске на 3 секунды, чтобы пользователь увидел
+        setTimeout(() => { controlsUi.classList.add('hidden'); }, 3000);
+
+        window.addEventListener('keydown', (e) => {
+            // Игнорируем, если фокус в текстовом поле (на всякий случай)
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+            let changed = false;
+
+            // Скрыть/Показать панель (H или Р)
+            if (e.key === 'h' || e.key === 'H' || e.key === 'р' || e.key === 'Р') {
+                controlsUi.classList.toggle('hidden');
+            }
+            
+            // Движение
+            if (e.key === 'ArrowUp') { camY -= 10; changed = true; e.preventDefault(); }
+            if (e.key === 'ArrowDown') { camY += 10; changed = true; e.preventDefault(); }
+            if (e.key === 'ArrowLeft') { camX -= 10; changed = true; e.preventDefault(); }
+            if (e.key === 'ArrowRight') { camX += 10; changed = true; e.preventDefault(); }
+
+            // Масштаб
+            if (e.key === '+' || e.key === '=') { camScale += 0.05; changed = true; }
+            if (e.key === '-' || e.key === '_') { camScale -= 0.05; changed = true; }
+
+            if (changed) {
+                // Применяем CSS-переменные
+                document.documentElement.style.setProperty('--cam-scale', camScale);
+                document.documentElement.style.setProperty('--cam-x', camX + 'px');
+                document.documentElement.style.setProperty('--cam-y', camY + 'px');
+                
+                // Обновляем текст в UI
+                uiScale.innerText = camScale.toFixed(2);
+                uiX.innerText = camX;
+                uiY.innerText = camY;
+            }
+        });
+
+        // ==========================================
+        // 5. ГЛАВНЫЙ ЦИКЛ
+        // ==========================================
+        function render() {
+            requestAnimationFrame(render);
+            renderCamera();
+
+            const time = ((performance.now() - startTime) / 1000.0) * 0.3;
+            let audio = [0, 0, 0];
+            
+            if (analyser && dataArray) {
+                analyser.getByteFrequencyData(dataArray);
+                const realAudio = [
+                    Math.min(getAverageVolume(20, 250) * 2.5, 1.0),
+                    Math.min(getAverageVolume(250, 2000) * 2.5, 1.0),
+                    Math.min(getAverageVolume(2000, 8000) * 2.5, 1.0)
+                ];
+                for (let i = 0; i < 3; i++) {
+                    const target = Math.max(realAudio[i], fakeAudio[i] * 0.15);
+                    smoothAudio[i] += (target - smoothAudio[i]) * 0.2;
+                    audio[i] = smoothAudio[i];
+                }
+            } else {
+                audio = fakeAudio;
+            }
+
+            const fakeSpeed = time * 0.5;
+            fakeAudio = [0.2 + Math.sin(fakeSpeed * 2.0) * 0.15, 0.1 + Math.sin(fakeSpeed * 3.0 + 1.0) * 0.1, 0.05 + Math.sin(fakeSpeed * 4.0 + 2.0) * 0.05];
+
+            const rotations = [[-0.3, 0.3, 0.2], [-0.3, -0.3, -0.2], [-0.3, -0.3, 0.2]];
+            const screenSize = [vibeCanvas.width, vibeCanvas.height];
+            const bgColor = [0.05, 0.05, 0.05]; 
+            const react = [0, 0, 0];
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+
+            // PASS 1
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fboNoise);
+            gl.viewport(0, 0, Math.round(vibeCanvas.width*0.5), Math.round(vibeCanvas.height*0.5));
+            gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.useProgram(progNoise);
+            gl.enableVertexAttribArray(gl.getAttribLocation(progNoise, "position"));
+            gl.vertexAttribPointer(gl.getAttribLocation(progNoise, "position"), 2, gl.FLOAT, false, 0, 0);
+            gl.uniform1f(gl.getUniformLocation(progNoise, "vTime"), time);
+            gl.uniform2fv(gl.getUniformLocation(progNoise, "vScreenSize"), screenSize);
+            gl.uniform1f(gl.getUniformLocation(progNoise, "vScale"), 1.0);
+            gl.uniform3fv(gl.getUniformLocation(progNoise, "vRotation"), [].concat(...rotations));
+            gl.uniform1fv(gl.getUniformLocation(progNoise, "vReact"), react);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+            // PASS 2
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fboSpark);
+            gl.viewport(0,0,512,1);
+            gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.useProgram(progSpark);
+            gl.enableVertexAttribArray(gl.getAttribLocation(progSpark, "position"));
+            gl.vertexAttribPointer(gl.getAttribLocation(progSpark, "position"), 2, gl.FLOAT, false, 0, 0);
+            gl.uniform1f(gl.getUniformLocation(progSpark, "vTime"), time);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+            // PASS 3
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(0,0,vibeCanvas.width, vibeCanvas.height);
+            gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.useProgram(progComposite);
+            gl.enableVertexAttribArray(gl.getAttribLocation(progComposite, "position"));
+            gl.vertexAttribPointer(gl.getAttribLocation(progComposite, "position"), 2, gl.FLOAT, false, 0, 0);
+            
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, texNoise);
+            gl.uniform1i(gl.getUniformLocation(progComposite, "vNoiseCache"), 0);
+            
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D, texSpark);
+            gl.uniform1i(gl.getUniformLocation(progComposite, "vSparkLut"), 1);
+
+            gl.uniform1f(gl.getUniformLocation(progComposite, "vTime"), time);
+            gl.uniform2fv(gl.getUniformLocation(progComposite, "vScreenSize"), screenSize);
+            gl.uniform1f(gl.getUniformLocation(progComposite, "vScale"), 1.0);
+            gl.uniform3fv(gl.getUniformLocation(progComposite, "vColorBackground"), bgColor);
+            gl.uniform3fv(gl.getUniformLocation(progComposite, "vColor"), [].concat(...colors));
+            gl.uniform3fv(gl.getUniformLocation(progComposite, "vRotation"), [].concat(...rotations));
+            gl.uniform1fv(gl.getUniformLocation(progComposite, "vAudio"), audio);
+            gl.uniform1fv(gl.getUniformLocation(progComposite, "vReact"), react);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        }
+
+        render();
+    </script>
+</body>
+</html>
